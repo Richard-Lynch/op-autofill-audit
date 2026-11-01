@@ -27,21 +27,25 @@ For every website whose hostname is the domain or a subdomain of it:
 | `AnywhereOnWebsite` | the default: fill on any page of the site, subdomains included | **yes** |
 | `Never` | autofill disabled for that website | **yes** (so you can confirm it is deliberate) |
 | `Unknown` | the setting could not be read; shown rather than assumed fine | **yes** |
+| `UnparseableURL` | the stored URL is malformed, so its host is unknown; shown, never skipped | **yes** |
 | `ExactDomain` | fill only when hostname **and port** match exactly (`www.` counts as different) | only with `--all` |
 
 `Never` is listed because it is "not exact-domain", not because it is wrong: it is the right setting
 for, say, several per-person logins on one hostname where autofill would only offer the wrong
 account. Read that group and decide.
 
-Matching is on the parsed hostname: `example.com` and `*.example.com` match, `notexample.com` and
+Matching is on the parsed hostname (a trailing DNS dot is ignored; a stored URL that can't be
+parsed is reported as `UnparseableURL` rather than skipped): `example.com` and `*.example.com` match, `notexample.com` and
 `example.com.evil.io` do not. URLs saved without a scheme or with a port are handled.
 
 ## Safety
 
 - **Read-only.** It lists items and reads their website entries. It never requests a field value
   (password, OTP, note), and nothing is written to 1Password.
-- **Local.** It talks to your desktop 1Password app over the SDK integration; nothing is sent
-  anywhere else, and nothing is written to disk except the `.env` you ask `--setup` to create.
+- **Local.** The audit reads item metadata through your desktop 1Password app (the SDK
+  integration) and prints results to stdout. On first run the bootstrap downloads the
+  dependencies into `.venv`, and the interactive setup can create or update `.env`. Nothing else
+  is written to disk and nothing is sent anywhere else.
 - **Output names real items.** Don't paste it somewhere public. `.gitignore` blocks `.env`,
   `*.json`, `*.csv`, `*.tsv` and `*.1pux` so a saved audit can't be committed by accident.
 - It exits **2** if it scanned zero items: that means "saw nothing" (wrong account, integration
@@ -54,9 +58,11 @@ Matching is on the parsed hostname: `example.com` and `*.example.com` match, `no
    and access lapses after 10 minutes idle.
 2. Run `./audit.py`. The first run:
    - creates `.venv` and installs `requirements.txt` into it, then restarts itself inside it
-     (you only need a system Python 3.9+; if that step fails it prints the manual commands);
-   - if the account or domain isn't configured and you're at a terminal, asks for them and writes a
-     `.env` (mode 600, gitignored) using `.env.example` as the template.
+     (you only need a system Python 3.10+; every run re-checks `requirements.txt`, so an
+     out-of-range SDK is repaired; if setup fails it prints the manual commands);
+   - if the account or domain isn't configured and you're at a terminal, asks for them (prompts go
+     to stderr, so `--json > file` stays valid) and writes a `.env` (mode 600, gitignored) using
+     `.env.example` as the template.
 
 `./audit.py --setup` re-runs the prompts later; Enter keeps the current values. Your account name or
 sign-in address is shown by `op account list`.
@@ -77,7 +83,9 @@ sign-in address is shown by `op account list`.
 | `--all` | also show websites already set to exact-domain |
 | `--json` | machine-readable output |
 
-Configuration precedence: **flag > real environment variable > `.env`**.
+Configuration precedence: **flag > real environment variable > `.env`**; blank values count as
+unset. `--domain` must be a bare domain (`example.com`, `*.example.com` is accepted); URLs, ports
+and paths are rejected rather than silently matching nothing.
 
 Text output is tab-separated, `vault  title  behaviour  url`, with a summary on stderr:
 
@@ -97,6 +105,9 @@ credentials. If you need bulk changes, script them against a throwaway item firs
 
 - Only items the SDK lists: active items in vaults your account can see (archived and trashed items
   are not included).
+- This audits the *stored* website settings, not effective behaviour in every client: 1Password
+  documents that the built-in Apple AutoFill suggestions on macOS, iOS and iPadOS don't reflect
+  per-host restrictions ([details](https://support.1password.com/autofill-behavior/)).
 - Only the per-website autofill setting. It doesn't look at URLs inside custom fields or notes.
 - The SDK integration needs the desktop app running and unlocked.
 
@@ -111,7 +122,8 @@ credentials. If you need bulk changes, script them against a throwaway item firs
 The tests need no 1Password, network or SDK: the audit (`collect`) is stubbed, and venv creation is
 tested with a faked `subprocess`. They cover hostname matching (including look-alike domains),
 classification, `.env` parsing and the interactive setup (including file mode), config precedence in
-`main()`, the exit-2 and `--setup` paths, and `bootstrap()`. CI runs them on every push and PR.
+`main()`, the exit-2 and `--setup` paths, and `bootstrap()`. CI runs them on pushes to `main` and on every pull request, on Python 3.10 and 3.12, plus an import
+smoke test of the SDK.
 A change to a guard should be proven by breaking it once and watching a test fail.
 
 ## Licence

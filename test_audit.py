@@ -35,10 +35,35 @@ def test_on_domain(host, expected):
         ("https://example.com/ui", "example.com"),
         ("Sub.Example.com:8006/x", "sub.example.com"),  # no scheme, port, mixed case
         ("http://h.example.com:3000/login", "h.example.com"),
+        ("//sub.example.com/login", "sub.example.com"),  # scheme-relative
+        ("example.com/?next=https://other.org", "example.com"),  # "://" in the query
+        ("example.com.", "example.com"),  # DNS root dot
+        ("  https://example.com  ", "example.com"),
     ],
 )
 def test_host_of(url, host):
     assert audit.host_of(url) == host
+
+
+@pytest.mark.parametrize(
+    "raw, domain",
+    [("example.com", "example.com"), (" *.Example.COM. ", "example.com")],
+)
+def test_normalize_domain(raw, domain):
+    assert audit.normalize_domain(raw) == domain
+
+
+@pytest.mark.parametrize("raw", ["https://example.com", "example.com:8006", "a.com/x", "*", "", "a b.com"])
+def test_normalize_domain_rejects_what_would_silently_match_nothing(raw):
+    with pytest.raises(ValueError):
+        audit.normalize_domain(raw)
+
+
+def test_malformed_url_is_reported_not_crashed_or_skipped():
+    with pytest.raises(ValueError):
+        audit.host_of("https://[bad")
+    got = audit.classify([site("https://[bad", "ExactDomain")], "example.com")
+    assert [s["behaviour"] for s in audit.not_exact(got)] == ["UnparseableURL"]
 
 
 @pytest.mark.parametrize(
@@ -80,13 +105,8 @@ def test_read_env_file(tmp_path, text, expected):
     assert audit.read_env_file(str(f)) == expected
 
 
-def test_read_env_missing_file_and_real_environment_wins(tmp_path):
+def test_read_env_missing_file(tmp_path):
     assert audit.read_env_file(str(tmp_path / "nope")) == {}
-    f = tmp_path / ".env"
-    f.write_text("KEEP=file\nNEW=file\n")
-    env = {"KEEP": "real"}
-    audit.load_env(str(f), env)
-    assert env == {"KEEP": "real", "NEW": "file"}
 
 
 TEMPLATE = "# header\n\n# the account\nA=ex1\n\n# the domain\n# second line\nB=ex2\n"
@@ -105,6 +125,7 @@ def test_parse_template_attaches_help_but_not_the_header():
         (["acct", "two words"], "", {"A": "acct", "B": "two words"}),
         (["", "", "real", "d.com"], "", {"A": "real", "B": "d.com"}),  # blank re-prompts
         (["", "new"], "A=keep\nB=old\n", {"A": "keep", "B": "new"}),  # Enter keeps current
+        (["", "x", "y"], "A=\nB=old\n", {"A": "x", "B": "y"}),  # a blank existing value is unset
     ],
 )
 def test_setup(tmp_path, answers, existing, expected):
@@ -114,7 +135,7 @@ def test_setup(tmp_path, answers, existing, expected):
         env.write_text(existing)
         env.chmod(0o644)
     it = iter(answers)
-    audit.setup(str(tmp_path / ".env.example"), str(env), ask=lambda _p: next(it), out=lambda *_: None)
+    audit.setup(str(tmp_path / ".env.example"), str(env), ask=lambda *_: next(it), out=lambda *_: None)
     assert audit.read_env_file(str(env)) == expected
     assert env.stat().st_mode & 0o777 == 0o600  # also tightens a loose pre-existing file
 
@@ -156,7 +177,7 @@ def m(tmp_path, monkeypatch):
         monkeypatch.setattr(audit.sys, "argv", ["audit.py", *argv])
         monkeypatch.setattr(audit.sys, "stdin", NS(isatty=lambda: tty))
         it = iter(answers)
-        monkeypatch.setattr("builtins.input", lambda _p: next(it))
+        monkeypatch.setattr("builtins.input", lambda *_: next(it))
         return audit.main()
 
     return NS(run=run, calls=calls, fake=fake_collect, env=tmp_path / ".env")
@@ -188,11 +209,35 @@ def test_main_zero_items_scanned_is_exit_2_not_clean(m, capsys):
         ([], "OP_ACCOUNT_NAME=f\nOP_AUDIT_DOMAIN=*.Example.COM\n", ("f", "example.com")),
         (["--domain", "flag.com"], "OP_ACCOUNT_NAME=f\nOP_AUDIT_DOMAIN=file.com\n", ("f", "flag.com")),
         (["--account", "a", "--domain", "d.com"], None, ("a", "d.com")),
+        ([], "OP_ACCOUNT_NAME=\nOP_AUDIT_DOMAIN=d.com\n", None),  # blank = missing, no tty -> error
     ],
 )
 def test_main_config_precedence_and_domain_normalising(m, argv, env_file, expected):
+    if expected is None:
+        with pytest.raises(SystemExit):
+            m.run(*argv, env_file=env_file)
+        return
     m.run(*argv, env_file=env_file)
     assert m.calls == [expected]
+
+
+@pytest.mark.parametrize("domain", ["https://example.com", "example.com:8006", "*"])
+def test_main_rejects_an_invalid_domain_instead_of_reporting_clean(m, domain):
+    with pytest.raises(SystemExit) as exc:
+        m.run("--account", "a", "--domain", domain)
+    assert exc.value.code == 2 and m.calls == []
+
+
+def test_first_run_prompts_go_to_stderr_so_json_stays_parseable(m, capsys):
+    assert m.run("--json", "--all", tty=True, answers=["me", "example.com"]) == 0
+    cap = capsys.readouterr()
+    assert len(json.loads(cap.out)) == 2 and "OP_ACCOUNT_NAME" in cap.err
+
+
+def test_setup_replaces_stale_config_instead_of_auditing_the_old_account(m):
+    m.run("--setup", tty=True, answers=["old", "example.com"])
+    m.run(tty=True, env_file="OP_ACCOUNT_NAME=old\n", answers=["new", "example.com"])
+    assert m.calls == [("new", "example.com")]
 
 
 def test_main_missing_config_without_a_tty_errors_instead_of_prompting(m):
@@ -265,3 +310,18 @@ def test_bootstrap_failure_names_the_manual_fix(boot):
     with pytest.raises(SystemExit, match="pip install -r requirements.txt"):
         audit.bootstrap()
     assert boot.execs == []
+
+
+def test_bootstrap_rejects_an_old_python_before_touching_anything(boot):
+    boot.mp.setattr(audit.sys, "version_info", (3, 9, 0))
+    with pytest.raises(SystemExit, match="3.10"):
+        audit.bootstrap()
+    assert boot.cmds == [] and boot.execs == []
+
+
+def test_bootstrap_reconciles_requirements_even_when_the_sdk_imports(boot):
+    boot.py.parent.mkdir(parents=True)
+    boot.py.write_text("")
+    boot.mp.setattr(audit.sys, "prefix", str(boot.venv))
+    audit.bootstrap()
+    assert any("pip install" in c for c in boot.cmds) and boot.execs == []

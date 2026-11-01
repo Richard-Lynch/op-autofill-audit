@@ -19,12 +19,15 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 from typing import NamedTuple
 from urllib.parse import urlparse
 
 EXACT = "ExactDomain"
+MIN_PYTHON = (3, 10)  # the SDK evaluates `X | Y` annotations at import time
+SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(HERE, ".env")
 ENV_TEMPLATE = os.path.join(HERE, ".env.example")
@@ -48,8 +51,12 @@ def _log(msg: str) -> None:
 def bootstrap() -> None:
     """Ensure .venv exists with the requirements installed, then re-exec inside it.
 
-    A no-op when already running in that venv. Any failure is reported with the manual
-    command, rather than carrying on to an ImportError further down."""
+    Runs `pip install -r requirements.txt` every time: a no-op when satisfied, and it repairs
+    a venv holding an out-of-range SDK, which an import check would accept. Skipped when the
+    guard is set. Any failure is reported with the manual command, rather than carrying on to
+    an ImportError further down."""
+    if sys.version_info < MIN_PYTHON:
+        raise SystemExit(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required, found {sys.version.split()[0]}")
     if os.environ.get(BOOTSTRAPPED):
         return
     py = _venv_python()
@@ -57,9 +64,8 @@ def bootstrap() -> None:
         if not os.path.exists(py):
             _log("first run: creating .venv")
             subprocess.run([sys.executable, "-m", "venv", VENV_DIR], check=True)
-        if subprocess.run([py, "-c", "import onepassword"], capture_output=True).returncode:
-            _log("installing requirements into .venv")
-            subprocess.run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", REQUIREMENTS], check=True)
+        pip = [py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", REQUIREMENTS]
+        subprocess.run(pip, check=True)
     except (subprocess.CalledProcessError, OSError) as exc:
         raise SystemExit(
             f"venv setup failed ({exc}). Do it by hand:\n"
@@ -99,13 +105,6 @@ def read_env_file(path: str) -> dict:
     return out
 
 
-def load_env(path: str = ENV_FILE, environ=os.environ) -> None:
-    """Load a .env file into `environ` without overriding anything already set there
-    (a real environment variable beats the file)."""
-    for key, value in read_env_file(path).items():
-        environ.setdefault(key, value)
-
-
 def parse_template(text: str) -> list[Entry]:
     """Entries from a .env.example. Comment lines directly above a KEY=value line are
     its help text; a blank line ends a comment block (so a file header isn't attached)."""
@@ -134,16 +133,27 @@ def render_env(entries: list[Entry], values: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def _err(*args) -> None:
+    """Interactive text goes to stderr so `--json > file` stays parseable."""
+    print(*args, file=sys.stderr)
+
+
+def _ask(prompt: str) -> str:
+    print(prompt, end="", file=sys.stderr, flush=True)
+    return input()
+
+
 def setup(
     template: str = ENV_TEMPLATE,
     env_path: str = ENV_FILE,
     ask=None,
-    out=print,
+    out=None,
 ) -> dict:
     """Interactively write env_path from the template. Existing values are the defaults
     (Enter keeps them); the template's example values are hints only and never accepted
     as answers, because a placeholder in .env would look configured and not be."""
-    ask = ask or input  # resolved at call time so tests can patch builtins.input
+    ask = ask or _ask  # resolved at call time so tests can patch builtins.input
+    out = out or _err
     try:
         entries = parse_template(open(template, encoding="utf-8").read())
     except FileNotFoundError:
@@ -177,9 +187,20 @@ def setup(
 
 
 def host_of(url: str) -> str:
-    """Hostname of a stored URL; tolerates entries saved without a scheme."""
-    parsed = urlparse(url if "://" in url else f"//{url}")
-    return (parsed.hostname or "").lower()
+    """Hostname of a stored URL; tolerates a missing scheme. Raises ValueError if malformed."""
+    url = url.strip()
+    if not (SCHEME.match(url) or url.startswith("//")):
+        url = "//" + url
+    return (urlparse(url).hostname or "").lower().rstrip(".")
+
+
+def normalize_domain(raw: str) -> str:
+    """'*.Example.com.' -> 'example.com'. Rejects URLs, ports, paths and stray wildcards,
+    which would otherwise match nothing and read as a clean report."""
+    domain = raw.strip().lower().removeprefix("*.").removesuffix(".")
+    if not domain or any(c in domain for c in "/:*@?# "):
+        raise ValueError(f"expected a bare domain such as example.com, got {raw!r}")
+    return domain
 
 
 def on_domain(host: str, domain: str) -> bool:
@@ -197,8 +218,11 @@ def classify(websites, domain: str) -> list[dict]:
     .url and .autofill_behavior (the SDK's Website type)."""
     out = []
     for site in websites or []:
-        if on_domain(host_of(site.url), domain):
-            out.append({"url": site.url, "behaviour": behaviour_name(site.autofill_behavior)})
+        try:
+            if on_domain(host_of(site.url), domain):
+                out.append({"url": site.url, "behaviour": behaviour_name(site.autofill_behavior)})
+        except ValueError:  # can't tell whether it is on the domain: show it, never skip it
+            out.append({"url": site.url, "behaviour": "UnparseableURL"})
     return out
 
 
@@ -231,8 +255,13 @@ async def collect(account: str, domain: str) -> tuple[list[dict], int]:
     return rows, seen
 
 
+def resolve_config(args) -> tuple:
+    """(account, domain): flag > real environment variable > .env. Blank values count as unset."""
+    cfg = {k: v for k, v in {**read_env_file(ENV_FILE), **os.environ}.items() if v}
+    return args.account or cfg.get("OP_ACCOUNT_NAME"), args.domain or cfg.get("OP_AUDIT_DOMAIN")
+
+
 def main() -> int:
-    load_env(ENV_FILE)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--domain", help="e.g. example.com, matches subdomains (or OP_AUDIT_DOMAIN)")
     ap.add_argument("--account", help="1Password account name or address (or OP_ACCOUNT_NAME)")
@@ -245,21 +274,21 @@ def main() -> int:
         setup(ENV_TEMPLATE, ENV_FILE)
         return 0
 
-    args.account = args.account or os.environ.get("OP_ACCOUNT_NAME")
-    args.domain = args.domain or os.environ.get("OP_AUDIT_DOMAIN")
-    if (not args.account or not args.domain) and sys.stdin.isatty():
-        print("Missing configuration; let's set it up.\n", file=sys.stderr)
+    account, domain = resolve_config(args)
+    if (not account or not domain) and sys.stdin.isatty():
+        _err("Missing configuration; let's set it up.\n")
         setup(ENV_TEMPLATE, ENV_FILE)
-        load_env(ENV_FILE)
-        args.account = args.account or os.environ.get("OP_ACCOUNT_NAME")
-        args.domain = args.domain or os.environ.get("OP_AUDIT_DOMAIN")
-    if not args.account:
+        account, domain = resolve_config(args)
+    if not account:
         ap.error("--account (or OP_ACCOUNT_NAME) is required; try --setup")
-    if not args.domain:
+    if not domain:
         ap.error("--domain (or OP_AUDIT_DOMAIN) is required; try --setup")
+    try:
+        domain = normalize_domain(domain)
+    except ValueError as exc:
+        ap.error(str(exc))
 
-    domain = args.domain.lower().lstrip("*.")
-    rows, seen = asyncio.run(collect(args.account, domain))
+    rows, seen = asyncio.run(collect(account, domain))
     # Zero items scanned means we saw nothing, not that nothing matches.
     if seen == 0:
         print("scanned zero items: not a clean result", file=sys.stderr)
