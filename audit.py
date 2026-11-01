@@ -7,6 +7,8 @@ no field values are ever requested.
 
     .venv/bin/python audit.py --domain example.com --account my.1password.com
 
+or put OP_ACCOUNT_NAME and OP_AUDIT_DOMAIN in a gitignored .env (see .env.example).
+
 Auth is the 1Password desktop-app integration (Settings > Developer > "Integrate with
 the 1Password SDKs"), which is the only SDK auth that can see personal vaults.
 """
@@ -21,6 +23,26 @@ import sys
 from urllib.parse import urlparse
 
 EXACT = "ExactDomain"
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def load_env(path: str = ENV_FILE, environ=os.environ) -> None:
+    """Read KEY=VALUE lines from a .env file into `environ` without overriding anything
+    already set there (a real environment variable beats the file). Blank lines and
+    `#` comments are skipped; one pair of surrounding quotes is stripped."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip().removeprefix("export ").strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        environ.setdefault(key, value)
 
 
 def host_of(url: str) -> str:
@@ -79,8 +101,13 @@ async def collect(account: str, domain: str) -> tuple[list[dict], int]:
 
 
 def main() -> int:
+    load_env()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--domain", required=True, help="e.g. example.com (matches subdomains too)")
+    ap.add_argument(
+        "--domain",
+        default=os.environ.get("OP_AUDIT_DOMAIN"),
+        help="e.g. example.com, matches subdomains too (or set OP_AUDIT_DOMAIN)",
+    )
     ap.add_argument(
         "--account",
         default=os.environ.get("OP_ACCOUNT_NAME"),
@@ -91,6 +118,8 @@ def main() -> int:
     args = ap.parse_args()
     if not args.account:
         ap.error("--account (or OP_ACCOUNT_NAME) is required")
+    if not args.domain:
+        ap.error("--domain (or OP_AUDIT_DOMAIN) is required")
 
     domain = args.domain.lower().lstrip("*.")
     rows, seen = asyncio.run(collect(args.account, domain))

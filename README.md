@@ -28,7 +28,9 @@ The `op` CLI cannot read this per-URL setting; the 1Password SDK can, so this us
 .venv/bin/python audit.py --domain example.com --account my.1password.com
 ```
 
-`--account` is your account name or sign-in address (or set `OP_ACCOUNT_NAME`).
+`--account` is your account name or sign-in address; `--domain` is the site to audit. Both can
+instead live in a gitignored `.env` (copy `.env.example`): `OP_ACCOUNT_NAME`, `OP_AUDIT_DOMAIN`.
+Real environment variables and flags override the file.
 Approve the prompt in the 1Password app (access lapses after 10 minutes idle).
 
 | flag | effect |

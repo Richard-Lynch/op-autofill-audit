@@ -48,3 +48,17 @@ def test_not_exact_flags_default_never_and_unknown():
 
 def test_no_websites_is_empty():
     assert audit.classify(None, "example.com") == []
+
+
+def test_load_env_parses_and_does_not_override(tmp_path):
+    f = tmp_path / ".env"
+    f.write_text('# c\n\nA=1\nexport B="two words"\nC=\'x\'\nKEEP=file\nnoequals\n')
+    env = {"KEEP": "real"}
+    audit.load_env(str(f), env)
+    assert env == {"A": "1", "B": "two words", "C": "x", "KEEP": "real"}
+
+
+def test_load_env_missing_file_is_noop(tmp_path):
+    env = {}
+    audit.load_env(str(tmp_path / "nope"), env)
+    assert env == {}
