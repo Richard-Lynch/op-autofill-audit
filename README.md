@@ -119,12 +119,15 @@ credentials. If you need bulk changes, script them against a throwaway item firs
 .venv/bin/python -m pytest
 ```
 
-The tests need no 1Password, network or SDK: the audit (`collect`) is stubbed, and venv creation is
-tested with a faked `subprocess`. They cover hostname matching (including look-alike domains),
-classification, `.env` parsing and the interactive setup (including file mode), config precedence in
-`main()`, the exit-2 and `--setup` paths, and `bootstrap()`. CI runs them on pushes to `main` and on every pull request, on Python 3.10 and 3.12, plus an import
-smoke test of the SDK.
-A change to a guard should be proven by breaking it once and watching a test fail.
+The tests need no 1Password, network or real SDK: `main()` runs with `collect()` stubbed, and
+`collect()` itself runs against a fake `onepassword` module (vault traversal, item counting, the
+no-vaults error). They cover the rules that matter -- hostname matching and look-alike domains,
+what counts as "not exact" (including unreadable and malformed entries), domain validation,
+`.env` and interactive setup, config precedence, and that zero scanned items is never a clean
+result. The venv bootstrap is exercised for real in CI (`./audit.py --help`) rather than with a
+faked `subprocess`. CI runs on pushes to `main` and on every pull request, on Python 3.10 and 3.12,
+plus an import smoke test of the SDK. Prove a change to a guard by breaking it once and watching a
+test fail.
 
 ## Licence
 
