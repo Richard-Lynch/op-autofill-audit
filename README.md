@@ -20,21 +20,27 @@ The `op` CLI cannot read this per-URL setting; the 1Password SDK can, so this us
 1. In the 1Password desktop app: Settings > Developer > enable
    "Integrate with the 1Password SDKs". This is the only SDK auth that can see personal vaults
    (service accounts cannot).
-2. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+2. `./audit.py`. That's it: the first run creates `.venv`, installs the requirements,
+   and, if `OP_ACCOUNT_NAME` / `OP_AUDIT_DOMAIN` aren't set, asks for them and writes a
+   gitignored `.env` (mode 600) using `.env.example` as the template. Needs only a system
+   Python 3.9+.
+
+`./audit.py --setup` re-runs that prompt later (Enter keeps current values).
 
 ## Use
 
 ```
-.venv/bin/python audit.py --domain example.com --account my.1password.com
+./audit.py                                   # config from .env
+./audit.py --domain example.com --account my.1password.com
 ```
 
-`--account` is your account name or sign-in address; `--domain` is the site to audit. Both can
-instead live in a gitignored `.env` (copy `.env.example`): `OP_ACCOUNT_NAME`, `OP_AUDIT_DOMAIN`.
-Real environment variables and flags override the file.
-Approve the prompt in the 1Password app (access lapses after 10 minutes idle).
+Account is your account name or sign-in address (`op account list` shows it). Flags beat real
+environment variables, which beat `.env`. Approve the prompt in the 1Password app (access
+lapses after 10 minutes idle).
 
 | flag | effect |
 |---|---|
+| `--setup` | write `.env` interactively and exit |
 | `--all` | also show websites already set to exact-domain |
 | `--json` | machine-readable output |
 
@@ -47,5 +53,6 @@ Matching is on the hostname: `example.com` and `*.example.com` match; `notexampl
 ## Develop
 
 ```
+./audit.py --help >/dev/null   # creates .venv
 .venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest
 ```

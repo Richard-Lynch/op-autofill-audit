@@ -5,9 +5,9 @@ For every item with a website on --domain (or a subdomain of it), report each su
 website's autofill behaviour. Read-only, and prints titles, vault names and URLs only;
 no field values are ever requested.
 
-    .venv/bin/python audit.py --domain example.com --account my.1password.com
-
-or put OP_ACCOUNT_NAME and OP_AUDIT_DOMAIN in a gitignored .env (see .env.example).
+    ./audit.py                 # first run creates .venv, installs deps, offers to write .env
+    ./audit.py --setup         # (re)create .env interactively from .env.example
+    ./audit.py --domain example.com --account my.1password.com
 
 Auth is the 1Password desktop-app integration (Settings > Developer > "Integrate with
 the 1Password SDKs"), which is the only SDK auth that can see personal vaults.
@@ -19,21 +19,74 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 EXACT = "ExactDomain"
-ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(HERE, ".env")
+ENV_TEMPLATE = os.path.join(HERE, ".env.example")
+VENV_DIR = os.path.join(HERE, ".venv")
+REQUIREMENTS = os.path.join(HERE, "requirements.txt")
+BOOTSTRAPPED = "AUDIT_BOOTSTRAPPED"  # set across the re-exec so it can never loop
 
 
-def load_env(path: str = ENV_FILE, environ=os.environ) -> None:
-    """Read KEY=VALUE lines from a .env file into `environ` without overriding anything
-    already set there (a real environment variable beats the file). Blank lines and
-    `#` comments are skipped; one pair of surrounding quotes is stripped."""
+# --- bootstrap: make `./audit.py` work from a bare clone (stdlib only) ---------------
+
+
+def _venv_python() -> str:
+    sub = "Scripts" if os.name == "nt" else "bin"
+    return os.path.join(VENV_DIR, sub, "python" + (".exe" if os.name == "nt" else ""))
+
+
+def _log(msg: str) -> None:
+    print(f"[audit] {msg}", file=sys.stderr)
+
+
+def bootstrap() -> None:
+    """Ensure .venv exists with the requirements installed, then re-exec inside it.
+
+    A no-op when already running in that venv. Any failure is reported with the manual
+    command, rather than carrying on to an ImportError further down."""
+    if os.environ.get(BOOTSTRAPPED):
+        return
+    py = _venv_python()
+    try:
+        if not os.path.exists(py):
+            _log("first run: creating .venv")
+            subprocess.run([sys.executable, "-m", "venv", VENV_DIR], check=True)
+        if subprocess.run([py, "-c", "import onepassword"], capture_output=True).returncode:
+            _log("installing requirements into .venv")
+            subprocess.run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "-r", REQUIREMENTS], check=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise SystemExit(
+            f"venv setup failed ({exc}). Do it by hand:\n"
+            f"  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+        )
+    if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
+        os.environ[BOOTSTRAPPED] = "1"
+        os.execv(py, [py, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+# --- .env handling ---------------------------------------------------------------------
+
+
+class Entry(NamedTuple):
+    key: str
+    example: str
+    help: str
+
+
+def read_env_file(path: str) -> dict:
+    """KEY=VALUE pairs from a .env file; {} if absent. Blank lines and `#` comments are
+    skipped; `export ` prefixes and one pair of surrounding quotes are stripped."""
     try:
         lines = open(path, encoding="utf-8").read().splitlines()
     except FileNotFoundError:
-        return
+        return {}
+    out = {}
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -42,7 +95,84 @@ def load_env(path: str = ENV_FILE, environ=os.environ) -> None:
         key, value = key.strip().removeprefix("export ").strip(), value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def load_env(path: str = ENV_FILE, environ=os.environ) -> None:
+    """Load a .env file into `environ` without overriding anything already set there
+    (a real environment variable beats the file)."""
+    for key, value in read_env_file(path).items():
         environ.setdefault(key, value)
+
+
+def parse_template(text: str) -> list[Entry]:
+    """Entries from a .env.example. Comment lines directly above a KEY=value line are
+    its help text; a blank line ends a comment block (so a file header isn't attached)."""
+    entries, help_lines = [], []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            help_lines.append(line.lstrip("#").strip())
+        elif not line:
+            help_lines = []
+        elif "=" in line:
+            key, _, example = line.partition("=")
+            entries.append(Entry(key.strip(), example.strip(), " ".join(help_lines)))
+            help_lines = []
+    return entries
+
+
+def render_env(entries: list[Entry], values: dict) -> str:
+    out = ["# Local config, gitignored. Real environment variables override these."]
+    for e in entries:
+        out.append("")
+        if e.help:
+            out.append(f"# {e.help}")
+        v = values[e.key]
+        out.append(f'{e.key}="{v}"' if any(c in v for c in " #\t") else f"{e.key}={v}")
+    return "\n".join(out) + "\n"
+
+
+def setup(
+    template: str = ENV_TEMPLATE,
+    env_path: str = ENV_FILE,
+    ask=input,
+    out=print,
+) -> dict:
+    """Interactively write env_path from the template. Existing values are the defaults
+    (Enter keeps them); the template's example values are hints only and never accepted
+    as answers, because a placeholder in .env would look configured and not be."""
+    try:
+        entries = parse_template(open(template, encoding="utf-8").read())
+    except FileNotFoundError:
+        raise SystemExit(f"template not found: {template}")
+    if not entries:
+        raise SystemExit(f"no KEY=value lines in {template}")
+    current = read_env_file(env_path)
+    if current:
+        out(f"Existing {os.path.basename(env_path)} found: Enter keeps the current value.")
+    values = {}
+    for e in entries:
+        if e.help:
+            out(f"\n{e.help}")
+        while True:
+            default = current.get(e.key, "")
+            hint = f"[{default}]" if default else f"(e.g. {e.example})"
+            answer = ask(f"{e.key} {hint}: ").strip() or default
+            if answer:
+                values[e.key] = answer
+                break
+            out("  a value is required")
+    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(render_env(entries, values))
+    os.chmod(env_path, 0o600)  # O_CREAT's mode is ignored for a pre-existing file
+    out(f"\nWrote {env_path} (mode 600, gitignored).")
+    return values
+
+
+# --- the audit -------------------------------------------------------------------------
 
 
 def host_of(url: str) -> str:
@@ -103,23 +233,29 @@ async def collect(account: str, domain: str) -> tuple[list[dict], int]:
 def main() -> int:
     load_env()
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument(
-        "--domain",
-        default=os.environ.get("OP_AUDIT_DOMAIN"),
-        help="e.g. example.com, matches subdomains too (or set OP_AUDIT_DOMAIN)",
-    )
-    ap.add_argument(
-        "--account",
-        default=os.environ.get("OP_ACCOUNT_NAME"),
-        help="1Password account name or sign-in address (or set OP_ACCOUNT_NAME)",
-    )
+    ap.add_argument("--domain", help="e.g. example.com, matches subdomains (or OP_AUDIT_DOMAIN)")
+    ap.add_argument("--account", help="1Password account name or address (or OP_ACCOUNT_NAME)")
+    ap.add_argument("--setup", action="store_true", help="write .env interactively and exit")
     ap.add_argument("--all", action="store_true", help="also list items already exact-domain")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args()
+
+    if args.setup:
+        setup()
+        return 0
+
+    args.account = args.account or os.environ.get("OP_ACCOUNT_NAME")
+    args.domain = args.domain or os.environ.get("OP_AUDIT_DOMAIN")
+    if (not args.account or not args.domain) and sys.stdin.isatty():
+        print("Missing configuration; let's set it up.\n", file=sys.stderr)
+        setup()
+        load_env()
+        args.account = args.account or os.environ.get("OP_ACCOUNT_NAME")
+        args.domain = args.domain or os.environ.get("OP_AUDIT_DOMAIN")
     if not args.account:
-        ap.error("--account (or OP_ACCOUNT_NAME) is required")
+        ap.error("--account (or OP_ACCOUNT_NAME) is required; try --setup")
     if not args.domain:
-        ap.error("--domain (or OP_AUDIT_DOMAIN) is required")
+        ap.error("--domain (or OP_AUDIT_DOMAIN) is required; try --setup")
 
     domain = args.domain.lower().lstrip("*.")
     rows, seen = asyncio.run(collect(args.account, domain))
@@ -149,4 +285,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    bootstrap()
     sys.exit(main())
