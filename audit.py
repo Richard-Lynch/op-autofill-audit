@@ -137,12 +137,13 @@ def render_env(entries: list[Entry], values: dict) -> str:
 def setup(
     template: str = ENV_TEMPLATE,
     env_path: str = ENV_FILE,
-    ask=input,
+    ask=None,
     out=print,
 ) -> dict:
     """Interactively write env_path from the template. Existing values are the defaults
     (Enter keeps them); the template's example values are hints only and never accepted
     as answers, because a placeholder in .env would look configured and not be."""
+    ask = ask or input  # resolved at call time so tests can patch builtins.input
     try:
         entries = parse_template(open(template, encoding="utf-8").read())
     except FileNotFoundError:
@@ -231,7 +232,7 @@ async def collect(account: str, domain: str) -> tuple[list[dict], int]:
 
 
 def main() -> int:
-    load_env()
+    load_env(ENV_FILE)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--domain", help="e.g. example.com, matches subdomains (or OP_AUDIT_DOMAIN)")
     ap.add_argument("--account", help="1Password account name or address (or OP_ACCOUNT_NAME)")
@@ -241,15 +242,15 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.setup:
-        setup()
+        setup(ENV_TEMPLATE, ENV_FILE)
         return 0
 
     args.account = args.account or os.environ.get("OP_ACCOUNT_NAME")
     args.domain = args.domain or os.environ.get("OP_AUDIT_DOMAIN")
     if (not args.account or not args.domain) and sys.stdin.isatty():
         print("Missing configuration; let's set it up.\n", file=sys.stderr)
-        setup()
-        load_env()
+        setup(ENV_TEMPLATE, ENV_FILE)
+        load_env(ENV_FILE)
         args.account = args.account or os.environ.get("OP_ACCOUNT_NAME")
         args.domain = args.domain or os.environ.get("OP_AUDIT_DOMAIN")
     if not args.account:

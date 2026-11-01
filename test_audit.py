@@ -1,4 +1,9 @@
+import json
+import os
+import subprocess
 from types import SimpleNamespace as NS
+
+import pytest
 
 import audit
 
@@ -7,104 +12,256 @@ def site(url, behaviour):
     return NS(url=url, autofill_behavior=NS(value=behaviour) if behaviour else None)
 
 
-def test_domain_and_subdomain_match():
-    assert audit.on_domain("example.com", "example.com")
-    assert audit.on_domain("a.b.example.com", "example.com")
+# --- matching and classification ----------------------------------------------------
 
 
-def test_lookalike_domains_do_not_match():
-    assert not audit.on_domain("notexample.com", "example.com")
-    assert not audit.on_domain("example.com.evil.io", "example.com")
+@pytest.mark.parametrize(
+    "host, expected",
+    [
+        ("example.com", True),
+        ("a.b.example.com", True),
+        ("notexample.com", False),  # suffix match without the dot boundary
+        ("example.com.evil.io", False),
+        ("", False),
+    ],
+)
+def test_on_domain(host, expected):
+    assert audit.on_domain(host, "example.com") is expected
 
 
-def test_host_of_tolerates_missing_scheme_and_port():
-    assert audit.host_of("Sub.Example.com:8006/x") == "sub.example.com"
-    assert audit.host_of("https://example.com/ui") == "example.com"
+@pytest.mark.parametrize(
+    "url, host",
+    [
+        ("https://example.com/ui", "example.com"),
+        ("Sub.Example.com:8006/x", "sub.example.com"),  # no scheme, port, mixed case
+        ("http://h.example.com:3000/login", "h.example.com"),
+    ],
+)
+def test_host_of(url, host):
+    assert audit.host_of(url) == host
 
 
-def test_classify_keeps_only_matching_sites():
-    sites = [site("https://a.example.com", "ExactDomain"), site("https://other.org", "Never")]
-    assert audit.classify(sites, "example.com") == [
-        {"url": "https://a.example.com", "behaviour": "ExactDomain"}
+@pytest.mark.parametrize(
+    "value, name",
+    [(NS(value="Never"), "Never"), ("ExactDomain", "ExactDomain"), (None, "Unknown")],
+)
+def test_behaviour_name(value, name):
+    assert audit.behaviour_name(value) == name
+
+
+def test_classify_filters_domain_and_not_exact_keeps_everything_else():
+    sites = [
+        site("https://a.example.com", "AnywhereOnWebsite"),
+        site("https://b.example.com", "Never"),
+        site("https://c.example.com", None),  # unreadable must not read as fine
+        site("https://d.example.com", "ExactDomain"),
+        site("https://other.org", "Never"),  # wrong domain
     ]
-
-
-def test_not_exact_flags_default_never_and_unknown():
-    got = audit.classify(
-        [
-            site("https://a.example.com", "AnywhereOnWebsite"),
-            site("https://b.example.com", "Never"),
-            site("https://c.example.com", None),
-            site("https://d.example.com", "ExactDomain"),
-        ],
-        "example.com",
-    )
-    assert [s["behaviour"] for s in audit.not_exact(got)] == [
-        "AnywhereOnWebsite",
-        "Never",
-        "Unknown",
-    ]
-
-
-def test_no_websites_is_empty():
+    got = audit.classify(sites, "example.com")
+    assert len(got) == 4
+    assert [s["behaviour"] for s in audit.not_exact(got)] == ["AnywhereOnWebsite", "Never", "Unknown"]
     assert audit.classify(None, "example.com") == []
 
 
-def test_load_env_parses_and_does_not_override(tmp_path):
+# --- .env parsing, template and interactive setup ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ('# c\n\nA=1\nexport B="two words"\nC=\'x\'\nnoequals\n', {"A": "1", "B": "two words", "C": "x"}),
+        ("A=\n", {"A": ""}),
+        ("", {}),
+    ],
+)
+def test_read_env_file(tmp_path, text, expected):
     f = tmp_path / ".env"
-    f.write_text('# c\n\nA=1\nexport B="two words"\nC=\'x\'\nKEEP=file\nnoequals\n')
+    f.write_text(text)
+    assert audit.read_env_file(str(f)) == expected
+
+
+def test_read_env_missing_file_and_real_environment_wins(tmp_path):
+    assert audit.read_env_file(str(tmp_path / "nope")) == {}
+    f = tmp_path / ".env"
+    f.write_text("KEEP=file\nNEW=file\n")
     env = {"KEEP": "real"}
     audit.load_env(str(f), env)
-    assert env == {"A": "1", "B": "two words", "C": "x", "KEEP": "real"}
-
-
-def test_load_env_missing_file_is_noop(tmp_path):
-    env = {}
-    audit.load_env(str(tmp_path / "nope"), env)
-    assert env == {}
+    assert env == {"KEEP": "real", "NEW": "file"}
 
 
 TEMPLATE = "# header\n\n# the account\nA=ex1\n\n# the domain\n# second line\nB=ex2\n"
 
 
-def test_parse_template_attaches_help_but_not_header():
-    got = audit.parse_template(TEMPLATE)
-    assert got == [
+def test_parse_template_attaches_help_but_not_the_header():
+    assert audit.parse_template(TEMPLATE) == [
         audit.Entry("A", "ex1", "the account"),
         audit.Entry("B", "ex2", "the domain second line"),
     ]
 
 
-def _run_setup(tmp_path, answers, existing=None):
-    tpl = tmp_path / ".env.example"
-    tpl.write_text(TEMPLATE)
+@pytest.mark.parametrize(
+    "answers, existing, expected",
+    [
+        (["acct", "two words"], "", {"A": "acct", "B": "two words"}),
+        (["", "", "real", "d.com"], "", {"A": "real", "B": "d.com"}),  # blank re-prompts
+        (["", "new"], "A=keep\nB=old\n", {"A": "keep", "B": "new"}),  # Enter keeps current
+    ],
+)
+def test_setup(tmp_path, answers, existing, expected):
+    (tmp_path / ".env.example").write_text(TEMPLATE)
     env = tmp_path / ".env"
     if existing:
         env.write_text(existing)
+        env.chmod(0o644)
     it = iter(answers)
-    audit.setup(str(tpl), str(env), ask=lambda _p: next(it), out=lambda *_: None)
-    return env
+    audit.setup(str(tmp_path / ".env.example"), str(env), ask=lambda _p: next(it), out=lambda *_: None)
+    assert audit.read_env_file(str(env)) == expected
+    assert env.stat().st_mode & 0o777 == 0o600  # also tightens a loose pre-existing file
 
 
-def test_setup_writes_values_mode_600_and_roundtrips(tmp_path):
-    env = _run_setup(tmp_path, ["acct", "two words"])
-    assert oct(env.stat().st_mode & 0o777) == "0o600"
-    assert audit.read_env_file(str(env)) == {"A": "acct", "B": "two words"}
+# --- main(): config precedence, filtering, exit codes ---------------------------------
+
+ROWS = [
+    {"vault": "V", "title": "Mixed", "id": "1", "sites": [
+        {"url": "https://a.example.com", "behaviour": "ExactDomain"},
+        {"url": "https://b.example.com", "behaviour": "AnywhereOnWebsite"},
+    ]},
+    {"vault": "V", "title": "AllExact", "id": "2", "sites": [
+        {"url": "https://c.example.com", "behaviour": "ExactDomain"},
+    ]},
+]  # fmt: skip
 
 
-def test_setup_reprompts_on_blank_and_never_accepts_the_example(tmp_path):
-    env = _run_setup(tmp_path, ["", "", "real", "d.com"])
-    assert audit.read_env_file(str(env)) == {"A": "real", "B": "d.com"}
+@pytest.fixture
+def m(tmp_path, monkeypatch):
+    """main() with no real .env or config in the environment, and collect() stubbed."""
+    monkeypatch.setattr(audit, "ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setattr(audit, "ENV_TEMPLATE", str(tmp_path / ".env.example"))
+    (tmp_path / ".env.example").write_text("# a\nOP_ACCOUNT_NAME=x\n\n# d\nOP_AUDIT_DOMAIN=y\n")
+    for k in ("OP_ACCOUNT_NAME", "OP_AUDIT_DOMAIN"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(audit.sys, "stdin", NS(isatty=lambda: False))
+    calls = []
+
+    async def fake_collect(account, domain):
+        calls.append((account, domain))
+        return fake_collect.result
+
+    fake_collect.result = (ROWS, 10)
+    monkeypatch.setattr(audit, "collect", fake_collect)
+
+    def run(*argv, env_file=None, tty=False, answers=()):
+        if env_file is not None:
+            (tmp_path / ".env").write_text(env_file)
+        monkeypatch.setattr(audit.sys, "argv", ["audit.py", *argv])
+        monkeypatch.setattr(audit.sys, "stdin", NS(isatty=lambda: tty))
+        it = iter(answers)
+        monkeypatch.setattr("builtins.input", lambda _p: next(it))
+        return audit.main()
+
+    return NS(run=run, calls=calls, fake=fake_collect, env=tmp_path / ".env")
 
 
-def test_setup_enter_keeps_existing_values(tmp_path):
-    env = _run_setup(tmp_path, ["", "new"], existing="A=keep\nB=old\n")
-    assert audit.read_env_file(str(env)) == {"A": "keep", "B": "new"}
+@pytest.mark.parametrize(
+    "extra, titles",
+    [([], ["Mixed"]), (["--all"], ["AllExact", "Mixed"])],
+)
+def test_main_json_filters_exact_unless_all(m, capsys, extra, titles):
+    assert m.run("--account", "a", "--domain", "example.com", "--json", *extra) == 0
+    assert sorted(r["title"] for r in json.loads(capsys.readouterr().out)) == titles
 
 
-def test_setup_tightens_a_loose_existing_file(tmp_path):
-    env = tmp_path / ".env"
-    env.write_text("A=x\nB=y\n")
-    env.chmod(0o644)
-    _run_setup(tmp_path, ["", ""], existing="A=x\nB=y\n")
-    assert oct(env.stat().st_mode & 0o777) == "0o600"
+def test_main_text_output_is_tab_separated(m, capsys):
+    m.run("--account", "a", "--domain", "example.com")
+    assert capsys.readouterr().out.strip() == "V\tMixed\tAnywhereOnWebsite\thttps://b.example.com"
+
+
+def test_main_zero_items_scanned_is_exit_2_not_clean(m, capsys):
+    m.fake.result = ([], 0)
+    assert m.run("--account", "a", "--domain", "example.com") == 2
+    assert "not a clean result" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv, env_file, expected",
+    [
+        ([], "OP_ACCOUNT_NAME=f\nOP_AUDIT_DOMAIN=*.Example.COM\n", ("f", "example.com")),
+        (["--domain", "flag.com"], "OP_ACCOUNT_NAME=f\nOP_AUDIT_DOMAIN=file.com\n", ("f", "flag.com")),
+        (["--account", "a", "--domain", "d.com"], None, ("a", "d.com")),
+    ],
+)
+def test_main_config_precedence_and_domain_normalising(m, argv, env_file, expected):
+    m.run(*argv, env_file=env_file)
+    assert m.calls == [expected]
+
+
+def test_main_missing_config_without_a_tty_errors_instead_of_prompting(m):
+    with pytest.raises(SystemExit) as exc:
+        m.run("--domain", "example.com")
+    assert exc.value.code == 2 and m.calls == []
+
+
+@pytest.mark.parametrize("argv, audits", [([], True), (["--setup"], False)])
+def test_main_setup_paths(m, argv, audits):
+    assert m.run(*argv, tty=True, answers=["me", "example.com"]) == 0
+    assert m.calls == ([("me", "example.com")] if audits else [])
+    assert audit.read_env_file(str(m.env)) == {"OP_ACCOUNT_NAME": "me", "OP_AUDIT_DOMAIN": "example.com"}
+
+
+# --- bootstrap(): venv creation, install and re-exec ----------------------------------
+
+
+@pytest.fixture
+def boot(tmp_path, monkeypatch):
+    venv = tmp_path / ".venv"
+    py = venv / "bin" / "python"
+    monkeypatch.setattr(audit, "VENV_DIR", str(venv))
+    monkeypatch.setattr(audit, "_venv_python", lambda: str(py))
+    monkeypatch.delenv(audit.BOOTSTRAPPED, raising=False)
+    monkeypatch.setattr(audit.sys, "prefix", "/some/other/prefix")
+    cmds, execs = [], []
+
+    def fake_run(cmd, **kw):
+        cmds.append(" ".join(cmd))
+        if "venv" in cmd:
+            py.parent.mkdir(parents=True)
+            py.write_text("")
+        # the `import onepassword` probe fails until pip has run
+        installed = any("pip install" in c for c in cmds)
+        return NS(returncode=0 if installed or "-c" not in cmd else 1)
+
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    monkeypatch.setattr(audit.os, "execv", lambda p, argv: execs.append(p))
+    return NS(cmds=cmds, execs=execs, py=py, venv=venv, mp=monkeypatch)
+
+
+def test_bootstrap_first_run_creates_venv_installs_and_reexecs(boot):
+    audit.bootstrap()
+    assert any("-m venv" in c for c in boot.cmds)
+    assert any("pip install" in c and "requirements.txt" in c for c in boot.cmds)
+    assert boot.execs == [str(boot.py)] and os.environ[audit.BOOTSTRAPPED] == "1"
+    boot.mp.delenv(audit.BOOTSTRAPPED)
+
+
+@pytest.mark.parametrize("in_venv, guard", [(False, True), (True, False)])
+def test_bootstrap_does_nothing_when_guarded_or_already_in_a_ready_venv(boot, in_venv, guard):
+    if guard:
+        boot.mp.setenv(audit.BOOTSTRAPPED, "1")
+    if in_venv:
+        boot.py.parent.mkdir(parents=True)
+        boot.py.write_text("")
+        boot.cmds.append("pip install")  # deps already present
+        boot.mp.setattr(audit.sys, "prefix", str(boot.venv))
+    n = len(boot.cmds)
+    audit.bootstrap()
+    assert boot.execs == [] and (guard is False or len(boot.cmds) == n)
+
+
+def test_bootstrap_failure_names_the_manual_fix(boot):
+    def boom(cmd, **kw):
+        raise subprocess.CalledProcessError(1, cmd)
+
+    boot.mp.setattr(audit.subprocess, "run", boom)
+    with pytest.raises(SystemExit, match="pip install -r requirements.txt"):
+        audit.bootstrap()
+    assert boot.execs == []
